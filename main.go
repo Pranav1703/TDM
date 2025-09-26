@@ -1,13 +1,12 @@
 package main
 
 import (
-	"fmt"
+
 	"shareIt/internal/server"
-	"shareIt/internal/tui"
+// 	"shareIt/internal/tui"
 )
 
-func main() {
-	fmt.Println("-----------------ShareIt CLI.-------------------")
-	go server.StartTcpServer()
-	tui.InitTui()
+func main() {	
+	server.StartTcpServer()
+	// tui.InitTui()
 }
