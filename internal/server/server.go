@@ -11,13 +11,16 @@ import (
 	"path/filepath"
 	"shareIt/internal/utils"
 	"sync"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 const TestFile1 =  "D:/Elden Ring Nightreign [DODI Repack]/data1.doi"
 const TestFile2 = "C:/Users/prana_zhfhs6u/Downloads/parsec-windows.exe"
 
-func StartTcpServer(killSwitch chan os.Signal) {
-	listener,err := net.Listen("tcp","127.0.0.1:8000")
+func StartTcpServer(killSwitch chan os.Signal, port int, p *tea.Program) {
+	listenAddr := fmt.Sprintf("0.0.0.0:%d", port)
+	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -34,8 +37,8 @@ func StartTcpServer(killSwitch chan os.Signal) {
 			}
 			
 			wg.Add(1)
-			log.Printf("Accepted connection from %s", conn.RemoteAddr())
-			go readLoop(conn, &wg)
+			p.Send(utils.LogMsg{Message: fmt.Sprintf("Accepted connection from %s", conn.RemoteAddr())})
+			go readLoop(conn, &wg, p)
 		}
 	}()
 	<-killSwitch
@@ -45,7 +48,7 @@ func StartTcpServer(killSwitch chan os.Signal) {
 	log.Println("All connections closed. Server gracefully shut down.")
 }
 
-func readLoop(conn net.Conn, wg *sync.WaitGroup){
+func readLoop(conn net.Conn, wg *sync.WaitGroup, p *tea.Program){
 	defer conn.Close()
 	defer wg.Done()
 	for{
@@ -84,22 +87,22 @@ func readLoop(conn net.Conn, wg *sync.WaitGroup){
 		}
 		defer outFile.Close()
 
-				// Create a progress writer to track the download.
-		progressWriter := utils.NewProgressWriter(fileSize, "Receiving")
+		// Create a progress writer to track the download.
+		progressWriter := utils.NewProgressWriter(fileSize, filename, "Receiving", p)
 		// Create a MultiWriter to write to both the file and the progress bar.
 		destWriter := io.MultiWriter(outFile, progressWriter)
 
-		n, err := io.CopyN(destWriter,conn,fileSize)
+		_, err = io.CopyN(destWriter,conn,fileSize)
 		if err != nil{
 			log.Printf("Error during file copy: %v", err)
 		}
-		fmt.Printf("Successfully saved file %s (%d bytes).\n", outFile.Name(), n)
+		p.Send(utils.LogMsg{Message: fmt.Sprintf("Successfully saved file %s", outFile.Name())})
 
 	}
 	
 }
 
-func SendFile(filePath string) error{
+func SendFile(filePath string,peerAddress string, p *tea.Program){
 	f , err :=os.Open(filePath)
 	if err!= nil{
 		log.Fatal("err opeing a file.",err)
@@ -116,7 +119,7 @@ func SendFile(filePath string) error{
 
 
 
-	conn , err := net.Dial("tcp",":8000")
+	conn , err := net.Dial("tcp",peerAddress)
 	if err!=nil{
 		log.Fatal(err)
 	}
@@ -139,14 +142,13 @@ func SendFile(filePath string) error{
 
 	bufferedReader := bufio.NewReader(f)
 
-	progressWriter := utils.NewProgressWriter(fileSize, "Transferring")
+	progressWriter := utils.NewProgressWriter(fileSize, filename, "Sending", p)
 
 	reader := io.TeeReader(bufferedReader, progressWriter)
 
-	n, err := io.Copy(conn, reader)
+	_, err = io.Copy(conn, reader)
 	if err!= nil{
 		log.Fatalln("couldnt copy to conn from buffer.",err)
 	}
-	log.Println("bytes sent to conn: ",n)
-	return nil
+	p.Send(utils.LogMsg{Message: fmt.Sprintf("Finished sending %s", filename)})
 }
