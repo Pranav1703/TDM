@@ -9,12 +9,16 @@ import (
 	"shareIt/internal/tui"
 	"syscall"
 	"time"
-
+		"flag"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
 func main() {	
-	const tcpPort = 8000
+
+	port := flag.Int("port", 8000, "The port for the TCP file server.")
+	flag.Parse()
+	tcpPort := *port 
+
 	f, err := tea.LogToFile("debug.log", "shareit")
 	if err != nil {
 		log.Fatal(err)
@@ -43,10 +47,10 @@ func main() {
 	// --- Start Backend Services in Goroutines ---
 
 	// Start the discovery service to announce our presence.
-	go server.AnnounceService(tcpPort)
+	go server.AnnounceService(myAddr)
 
 	// Start listening for peers and send updates to the TUI.
-	go server.ListenForPeers(p)
+	go server.ListenForPeers(p,myAddr)
 
 	// --- Start the TCP Server (with graceful shutdown) ---
 	shutdownSig := make(chan os.Signal, 1)

@@ -1,48 +1,41 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
 	"shareIt/internal/utils"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"golang.org/x/net/ipv4"
 )
 
 const (
-	// This is a multicast address and port.
 	multicastAddr    = "239.0.0.1:9999"
-	// This is the "magic" message prefix to identify our app's announcements.
 	messagePrefix    = "SHAREIT_DISCOVERY"
-	// How often to send out announcements.
 	announceInterval = 2 * time.Second
-	// How long to wait before considering a peer offline.
-	peerTimeout = 5 * time.Second
+	peerTimeout      = 5 * time.Second
 )
 
-// AnnounceService starts shouting on the network that our service is available.
-// It takes the port of our main TCP file server as an argument.
-func AnnounceService(tcpPort int) {
-	myIP, err := GetOutboundIP()
-	if err != nil {
-		log.Printf("Could not get local IP, announcements will be limited: %v", err)
-		myIP = "127.0.0.1" // Fallback
-	}
-	message := fmt.Sprintf("%s|%s:%d", messagePrefix, myIP, tcpPort)
-	addr, err := net.ResolveUDPAddr("udp", multicastAddr)
+// AnnounceService remains the same as your version.
+func AnnounceService(myAddr string) {
+	message := fmt.Sprintf("%s|%s", messagePrefix, myAddr)
+	addr, err := net.ResolveUDPAddr("udp4", multicastAddr)
 	if err != nil {
 		log.Fatalf("Error resolving multicast address: %v", err)
 	}
-	conn, err := net.DialUDP("udp", nil, addr)
+	conn, err := net.DialUDP("udp4", nil, addr)
 	if err != nil {
 		log.Fatalf("Error dialing multicast address: %v", err)
 	}
 	defer conn.Close()
 
-	log.Printf("Starting to announce service on %s", multicastAddr)
+	log.Printf("Starting to announce my address (%s) on %s", myAddr, multicastAddr)
 	for {
 		_, err := conn.Write([]byte(message))
 		if err != nil {
@@ -52,19 +45,63 @@ func AnnounceService(tcpPort int) {
 	}
 }
 
-// ListenForPeers runs a continuous loop to find peers and send updates to the TUI.
-func ListenForPeers(p *tea.Program) {
-	addr, err := net.ResolveUDPAddr("udp", multicastAddr)
+// ListenForPeers is updated to allow multiple listeners on the same port.
+func ListenForPeers(p *tea.Program, myAddr string) {
+	addr, err := net.ResolveUDPAddr("udp4", multicastAddr)
 	if err != nil {
 		log.Fatalf("Error resolving UDP addr for listener: %v", err)
 	}
-	conn, err := net.ListenMulticastUDP("udp", nil, addr)
-	if err != nil {
-		log.Fatalf("Error listening to multicast UDP: %v", err)
-	}
-	defer conn.Close()
 
-	// A map to keep track of peers and their last seen time.
+	// THE FIX: Use ListenConfig to set socket options before binding.
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var opErr error
+			err := c.Control(func(fd uintptr) {
+				// Set SO_REUSEADDR to allow multiple instances to bind to the same address.
+				opErr = syscall.SetsockoptInt(syscall.Handle(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+			})
+			if err != nil {
+				return err
+			}
+			return opErr
+		},
+	}
+
+	// Use the ListenConfig to create the packet listener.
+	l, err := lc.ListenPacket(context.Background(), "udp4", fmt.Sprintf("0.0.0.0:%d", addr.Port))
+	if err != nil {
+		log.Fatalf("Error listening for packets: %v", err)
+	}
+	defer l.Close()
+
+	packetConn := ipv4.NewPacketConn(l)
+
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		log.Fatalf("Error getting network interfaces: %v", err)
+	}
+
+	var joined bool
+	for _, iface := range interfaces {
+		if (iface.Flags&net.FlagUp) == 0 || (iface.Flags&net.FlagMulticast) == 0 || (iface.Flags&net.FlagLoopback) != 0 {
+			continue
+		}
+		if err := packetConn.JoinGroup(&iface, addr); err == nil {
+			log.Printf("Successfully joined multicast group on interface: %s", iface.Name)
+			joined = true
+			// We join on all suitable interfaces instead of just the first.
+		}
+	}
+
+	if !joined {
+		log.Printf("Warning: Could not join multicast group on any suitable interface. Discovery may not work.")
+	}
+
+	if err := packetConn.SetMulticastLoopback(true); err != nil {
+		log.Printf("Warning: could not enable multicast loopback: %v", err)
+	}
+
+	log.Printf("Listening for peer announcements on %s", multicastAddr)
 	peers := make(map[string]time.Time)
 	var mu sync.Mutex
 
@@ -77,10 +114,10 @@ func ListenForPeers(p *tea.Program) {
 			for peer, lastSeen := range peers {
 				if time.Since(lastSeen) > peerTimeout {
 					delete(peers, peer)
-					changed = true // Mark that the list has changed
+					changed = true
+					log.Printf("Peer timed out and was removed: %s", peer)
 				}
 			}
-			// If any peers were removed, send an updated list to the TUI.
 			if changed {
 				var currentPeers []string
 				for peer := range peers {
@@ -95,24 +132,31 @@ func ListenForPeers(p *tea.Program) {
 	// Main loop to listen for announcements.
 	buffer := make([]byte, 1024)
 	for {
-		n, _, err := conn.ReadFromUDP(buffer)
+		n, _, _, err := packetConn.ReadFrom(buffer)
 		if err != nil {
-			log.Printf("Error reading from UDP: %v", err)
+			log.Printf("Error reading from packet conn: %v", err)
 			continue
 		}
 
 		message := string(buffer[:n])
+		log.Printf("Received multicast message: \"%s\"", message)
+
 		if strings.HasPrefix(message, messagePrefix) {
 			parts := strings.Split(message, "|")
 			if len(parts) == 2 {
 				peerAddr := parts[1]
+				log.Printf("Discovered a potential peer: %s", peerAddr)
+
+				if peerAddr == myAddr {
+					log.Printf("Ignoring own announcement from %s", myAddr)
+					continue
+				}
+
 				mu.Lock()
-				// Check if it's a new peer.
 				_, exists := peers[peerAddr]
-				// Update the last seen time for the peer.
 				peers[peerAddr] = time.Now()
-				// If the peer is new, send an immediate update to the TUI.
 				if !exists {
+					log.Printf("New peer found: %s. Sending update to TUI.", peerAddr)
 					var currentPeers []string
 					for peer := range peers {
 						currentPeers = append(currentPeers, peer)
@@ -125,13 +169,14 @@ func ListenForPeers(p *tea.Program) {
 	}
 }
 
-// getOutboundIP is a helper to get the preferred outbound IP address of this machine.
+// GetOutboundIP remains the same.
 func GetOutboundIP() (string, error) {
 	conn, err := net.Dial("udp", "8.8.8.8:80")
 	if err != nil {
 		return "", err
 	}
 	defer conn.Close()
+
 	localAddr := conn.LocalAddr().(*net.UDPAddr)
 	return localAddr.IP.String(), nil
 }

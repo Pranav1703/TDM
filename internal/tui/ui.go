@@ -5,7 +5,7 @@ import (
 	"log"
 	"os"
 	"shareIt/internal/server"
-	"shareIt/internal/utils" // Correctly import the utils package
+	"shareIt/internal/utils"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -38,16 +38,17 @@ var (
 
 // mainModel is the top-level model for our application.
 type mainModel struct {
-	peers       sectionModel
-	uploads     sectionModel
-	downloads   sectionModel
-	input       textinput.Model
-	focus       int // To track which pane is focused
-	width       int
-	height      int
-	peerList    []string
-	transferLog map[string]string // Map to store transfer progress strings
-	program     *tea.Program      // To send messages from spawned goroutines
+	peers        sectionModel
+	uploads      sectionModel
+	downloads    sectionModel
+	input        textinput.Model
+	focus        int // To track which pane is focused
+	width        int
+	height       int
+	peerList     []string
+	selectedPeer int               // Index of the currently selected peer
+	transferLog  map[string]string // Map to store transfer progress strings
+	program      *tea.Program      // To send messages from spawned goroutines
 }
 
 // sectionModel represents one of the three panes in the UI.
@@ -55,6 +56,10 @@ type sectionModel struct {
 	title    string
 	viewport viewport.Model
 	focused  bool
+}
+
+func (m *mainModel) SetProgram(p *tea.Program) {
+	m.program = p
 }
 
 // newSection creates a new section with a given title.
@@ -101,11 +106,7 @@ func (m sectionModel) View() string {
 	return style.Render(content)
 }
 
-func (m *mainModel) SetProgram(p *tea.Program) {
-	m.program = p
-}
-
-// InitialModel sets up the initial state of our application.
+// InitialModel now returns a pointer to mainModel (*mainModel).
 func InitialModel() *mainModel {
 	ti := textinput.New()
 	ti.Placeholder = "Enter file path to upload..."
@@ -114,21 +115,22 @@ func InitialModel() *mainModel {
 	ti.Width = 20
 
 	m := mainModel{
-		peers:       newSection("PEERS"),
-		uploads:     newSection("UPLOADS"),
-		downloads:   newSection("DOWNLOADS"),
-		input:       ti,
-		focus:       uploads_focus,
-		transferLog: make(map[string]string),
+		peers:        newSection("PEERS"),
+		uploads:      newSection("UPLOADS"),
+		downloads:    newSection("DOWNLOADS"),
+		input:        ti,
+		focus:        uploads_focus,
+		selectedPeer: 0,
+		transferLog:  make(map[string]string),
 	}
 	m.uploads.focused = true
-	m.uploads.viewport.SetContent("Enter a file path and press Enter to send to the first available peer.")
+	m.uploads.viewport.SetContent("Enter a file path and press Enter to send to the selected peer.")
 	m.downloads.viewport.SetContent("Waiting for incoming files...")
 	return &m
 }
 
-// Init is the first command that is run when the program starts.
-func (m mainModel) Init() tea.Cmd {
+// Init now uses a pointer receiver for consistency.
+func (m *mainModel) Init() tea.Cmd {
 	return textinput.Blink
 }
 
@@ -138,10 +140,7 @@ func (m *mainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
-	// A message sent on startup to give the model a reference to the program.
-	case ProgramInitMsg:
-		m.program = msg.Program
-		return m, nil
+	// ProgramInitMsg case is no longer needed since we use SetProgram.
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -155,16 +154,13 @@ func (m *mainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.downloads.setSize(m.width, bottomRowHeight)
 		m.input.Width = rightColWidth - focusedStyle.GetHorizontalFrameSize() - 2
 
-	// A message that we have found peers on the network.
 	case utils.PeersUpdatedMsg:
 		m.peerList = msg.Peers
-		if len(m.peerList) > 0 {
-			m.peers.viewport.SetContent(strings.Join(m.peerList, "\n"))
-		} else {
-			m.peers.viewport.SetContent("Scanning for peers...")
+		if m.selectedPeer >= len(m.peerList) {
+			m.selectedPeer = 0 // Reset selection if it's out of bounds
 		}
+		m.updatePeersView()
 
-	// A message that a file transfer is in progress.
 	case utils.FileTransferMsg:
 		key := fmt.Sprintf("%s-%s", msg.Direction, msg.Filename)
 		m.transferLog[key] = fmt.Sprintf("%s: %s %.2f%% (%s)", msg.Direction, msg.Filename, msg.Progress, msg.Rate)
@@ -180,15 +176,31 @@ func (m *mainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.uploads.viewport.SetContent(strings.Join(uploads, "\n"))
 		m.downloads.viewport.SetContent(strings.Join(downloads, "\n"))
 
-	// A message to log something to the TUI.
 	case utils.LogMsg:
-		// For simplicity, we'll just log this to a file for now.
 		log.Println("TUI Log:", msg.Message)
 
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c", "esc":
 			return m, tea.Quit
+
+		// Handle navigation in the peers list
+		case "up", "k":
+			if m.focus == peers_focus && len(m.peerList) > 0 {
+				m.selectedPeer--
+				if m.selectedPeer < 0 {
+					m.selectedPeer = len(m.peerList) - 1
+				}
+				m.updatePeersView()
+			}
+		case "down", "j":
+			if m.focus == peers_focus && len(m.peerList) > 0 {
+				m.selectedPeer++
+				if m.selectedPeer >= len(m.peerList) {
+					m.selectedPeer = 0
+				}
+				m.updatePeersView()
+			}
 
 		case "tab":
 			m.focus = (m.focus + 1) % 3
@@ -206,14 +218,14 @@ func (m *mainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.focus == uploads_focus {
 				filePath := m.input.Value()
 				if _, err := os.Stat(filePath); os.IsNotExist(err) {
-					log.Printf("File does not exist: %s", filePath) // Log error
+					log.Printf("File does not exist: %s", filePath)
 					return m, nil
 				}
 
-				if len(m.peerList) > 0 {
-					peerAddr := m.peerList[0] // Send to the first peer for simplicity
+				if len(m.peerList) > 0 && m.selectedPeer < len(m.peerList) {
+					// Send the file to the currently selected peer.
+					peerAddr := m.peerList[m.selectedPeer]
 					log.Printf("Initiating send of %s to %s", filePath, peerAddr)
-					// Run the file send in a new goroutine so it doesn't block the TUI.
 					if m.program != nil {
 						go server.SendFile(filePath, peerAddr, m.program)
 					} else {
@@ -245,8 +257,28 @@ func (m *mainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-// View renders the entire UI.
-func (m mainModel) View() string {
+// updatePeersView is a helper function to render the list of peers with a selection indicator.
+func (m *mainModel) updatePeersView() {
+	if len(m.peerList) > 0 {
+		var s strings.Builder
+		selectedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("62")).Bold(true)
+
+		for i, peer := range m.peerList {
+			if i == m.selectedPeer {
+				s.WriteString(selectedStyle.Render("> "+peer) + "\n")
+			} else {
+				s.WriteString("  " + peer + "\n")
+			}
+		}
+		m.peers.viewport.SetContent(s.String())
+	} else {
+		m.selectedPeer = 0
+		m.peers.viewport.SetContent("Scanning for peers...")
+	}
+}
+
+// View now uses a pointer receiver for consistency.
+func (m *mainModel) View() string {
 	if m.width == 0 {
 		return "Initializing..."
 	}
@@ -269,5 +301,4 @@ func (m mainModel) View() string {
 		m.downloads.View(),
 	)
 }
-
 
